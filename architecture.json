@@ -1,0 +1,244 @@
+{
+  "assumptions": [
+    "Mid-range volume: ~5,000 transactions/day (~150,000/month)",
+    "~5% of transactions flagged (7,500/month), ~1% high-risk triggering SNS (1,500/month)",
+    "Bedrock explanation calls capped at 1,000/month using Claude 3 Haiku (~$0.38/month billed separately)",
+    "Isolation Forest model packaged as a Lambda layer (~50MB scikit-learn), needs 1024MB memory, ~3s inference",
+    "S3 stores ~1GB/month in Parquet format; Athena scans ~100MB/month (~$0.001)",
+    "Glue Data Catalog table defined in CloudFormation (no crawler), within free tier",
+    "DynamoDB on-demand billing — ideal for variable portfolio workload, with point-in-time recovery",
+    "All Lambda functions use arm64 (Graviton2) for ~20% cost savings vs x86",
+    "SQS: ~300K API calls/month (send + receive + delete operations)",
+    "10,000 GET queries/month for the flagged transactions endpoint",
+    "6 CloudWatch alarms: scoring-errors, api-5xx, dlq-depth, scoring-p99, throttles, cost-anomaly",
+    "4 custom metrics published via CloudWatch embedded metric format from Lambda",
+    "With AWS Free Tier (first 12 months): Lambda 1M requests + 400K GB-s free, HTTP API 1M requests free, SQS 1M requests free, DynamoDB 25GB free — actual cost likely under $5/month",
+    "Bedrock, Glue Data Catalog, and Athena costs not included in estimate; add ~$0.40/month total"
+  ],
+  "connections": [
+    {
+      "description": "POST /transactions → Lambda proxy integration",
+      "from": "transactions-api",
+      "to": "ingest-function"
+    },
+    {
+      "description": "GET /flagged → Lambda proxy integration",
+      "from": "transactions-api",
+      "to": "query-function"
+    },
+    {
+      "description": "SendMessage with validated transaction payload",
+      "from": "ingest-function",
+      "to": "processing-queue"
+    },
+    {
+      "description": "SQS event source mapping triggers scoring (batch size 10)",
+      "from": "processing-queue",
+      "to": "scoring-function"
+    },
+    {
+      "description": "Redrive policy: maxReceiveCount=3",
+      "from": "processing-queue",
+      "to": "dead-letter-queue"
+    },
+    {
+      "description": "PutObject to raw/ and scored/ prefixes in Parquet",
+      "from": "scoring-function",
+      "to": "transactions-bucket"
+    },
+    {
+      "description": "PutItem for flagged transactions (riskScore > 0.5)",
+      "from": "scoring-function",
+      "to": "flagged-table"
+    },
+    {
+      "description": "Publish alert for high-risk transactions (riskScore > 0.85)",
+      "from": "scoring-function",
+      "to": "alerts-topic"
+    },
+    {
+      "description": "Async Lambda invoke for flagged transactions needing explanation",
+      "from": "scoring-function",
+      "to": "explainer-function"
+    },
+    {
+      "description": "InvokeModel call to Claude 3 Haiku with transaction context",
+      "from": "explainer-function",
+      "to": "bedrock-ai"
+    },
+    {
+      "description": "UpdateItem to add explanation text to flagged record",
+      "from": "explainer-function",
+      "to": "flagged-table"
+    },
+    {
+      "description": "Query by PK/SK or GSI for filtered, paginated results",
+      "from": "query-function",
+      "to": "flagged-table"
+    },
+    {
+      "description": "Scans Parquet partitions via Glue catalog",
+      "from": "athena-queries",
+      "to": "transactions-bucket"
+    },
+    {
+      "description": "Schema overlay on S3 data lake partitions",
+      "from": "glue-catalog",
+      "to": "transactions-bucket"
+    }
+  ],
+  "name": "Serverless Fraud Detection Platform",
+  "region": "us-east-1",
+  "resources": [
+    {
+      "config": {
+        "apiType": "http",
+        "requestsPerMonth": 160000
+      },
+      "id": "transactions-api",
+      "name": "Transactions API",
+      "purpose": "HTTP API with two routes: POST /transactions for ingestion and GET /flagged for querying flagged transactions with explanations",
+      "type": "api-gateway"
+    },
+    {
+      "config": {
+        "architecture": "arm64",
+        "avgDurationMs": 200,
+        "memoryMb": 256,
+        "requestsPerMonth": 150000,
+        "timeoutSeconds": 10
+      },
+      "id": "ingest-function",
+      "name": "Transaction Ingest",
+      "purpose": "Validates incoming transaction payload (card, amount, merchant, location, timestamp), assigns a transaction ID, and sends it to the processing queue",
+      "type": "lambda"
+    },
+    {
+      "config": {
+        "requestsPerMonth": 300000
+      },
+      "id": "processing-queue",
+      "name": "Processing Queue",
+      "purpose": "Decouples ingestion from scoring, provides back-pressure and retry semantics with a 3-retry redrive policy to the DLQ",
+      "type": "sqs"
+    },
+    {
+      "config": {
+        "requestsPerMonth": 1000
+      },
+      "id": "dead-letter-queue",
+      "name": "Dead Letter Queue",
+      "purpose": "Captures messages that fail scoring 3 times for manual investigation; triggers a CloudWatch alarm when non-empty",
+      "type": "sqs"
+    },
+    {
+      "config": {
+        "architecture": "arm64",
+        "avgDurationMs": 3000,
+        "memoryMb": 1024,
+        "requestsPerMonth": 150000,
+        "timeoutSeconds": 30
+      },
+      "id": "scoring-function",
+      "name": "Fraud Scoring Engine",
+      "purpose": "Runs rule-based checks (amount threshold, velocity per card in 1h window, geo-impossible travel) then scores with an Isolation Forest model packaged as a Lambda layer. Writes raw+scored data to S3, flagged transactions to DynamoDB, high-risk alerts to SNS, and async-invokes the explainer for flagged items",
+      "type": "lambda"
+    },
+    {
+      "config": {
+        "getsPerMonth": 50000,
+        "putsPerMonth": 300000,
+        "storageGb": 1
+      },
+      "id": "transactions-bucket",
+      "name": "Transactions Data Lake",
+      "purpose": "Stores all transaction data partitioned by date (year/month/day) in Parquet format for efficient Athena queries. Separate prefixes for raw/ and scored/ data. Encryption at rest with SSE-S3, versioning disabled to save cost, lifecycle policy to move to Glacier after 90 days",
+      "type": "s3"
+    },
+    {
+      "config": {
+        "readsPerMonth": 20000,
+        "storageGb": 0.5,
+        "writesPerMonth": 15000
+      },
+      "id": "flagged-table",
+      "name": "Flagged Transactions Table",
+      "purpose": "Stores flagged transactions with attributes: transactionId (PK), timestamp (SK), riskScore, rulesFired, mlScore, explanation, merchantId, region. GSI on riskScore for high-risk queries. On-demand billing, encryption at rest, point-in-time recovery enabled",
+      "type": "dynamodb"
+    },
+    {
+      "config": {
+        "publishesPerMonth": 1500
+      },
+      "id": "alerts-topic",
+      "name": "Fraud Alerts Topic",
+      "purpose": "Publishes high-risk transaction alerts (riskScore > 0.85) to email subscribers. Message includes transaction ID, amount, merchant, risk score, and rules fired",
+      "type": "sns"
+    },
+    {
+      "config": {
+        "architecture": "arm64",
+        "avgDurationMs": 2000,
+        "memoryMb": 256,
+        "requestsPerMonth": 1000,
+        "timeoutSeconds": 30
+      },
+      "id": "explainer-function",
+      "name": "Bedrock Explainer",
+      "purpose": "Invoked asynchronously for flagged transactions. Calls Bedrock Claude 3 Haiku with the transaction context and scoring details to generate a plain-English fraud explanation. Enforces a monthly call cap via a DynamoDB counter. Updates the flagged table with the explanation",
+      "type": "lambda"
+    },
+    {
+      "config": {
+        "architecture": "arm64",
+        "avgDurationMs": 200,
+        "memoryMb": 256,
+        "requestsPerMonth": 10000,
+        "timeoutSeconds": 10
+      },
+      "id": "query-function",
+      "name": "Query Flagged Transactions",
+      "purpose": "Handles GET /flagged endpoint with optional query parameters (minRiskScore, startDate, endDate, merchantId). Returns paginated flagged transactions with their Bedrock explanations from DynamoDB",
+      "type": "lambda"
+    },
+    {
+      "config": {
+        "provider": "Amazon Bedrock"
+      },
+      "id": "bedrock-ai",
+      "name": "Amazon Bedrock (Claude 3 Haiku)",
+      "purpose": "Foundation model for generating plain-English fraud explanations. Capped at 1,000 calls/month (~$0.38/month). Prompt includes transaction details, risk score, rules fired, and ML anomaly score",
+      "type": "external"
+    },
+    {
+      "config": {
+        "provider": "AWS Glue"
+      },
+      "id": "glue-catalog",
+      "name": "AWS Glue Data Catalog",
+      "purpose": "Defines database and table schema over the S3 data lake, enabling Athena to query Parquet data without ETL. Table defined in CloudFormation (no crawler cost)",
+      "type": "external"
+    },
+    {
+      "config": {
+        "provider": "Amazon Athena"
+      },
+      "id": "athena-queries",
+      "name": "Amazon Athena",
+      "purpose": "Ad-hoc SQL analytics on fraud patterns: fraud rate by hour, top flagged merchants, geographic hot spots, risk score distributions. Uses Parquet columnar format to minimize data scanned (~$0.001/month)",
+      "type": "external"
+    },
+    {
+      "config": {
+        "alarms": 6,
+        "customMetrics": 4,
+        "logsGbPerMonth": 1
+      },
+      "id": "monitoring",
+      "name": "Monitoring Dashboard & Alarms",
+      "purpose": "Dashboard showing fraud rate, scoring latency, error rates, DLQ depth, API latency, and Bedrock call count. 6 alarms: scoring-errors, api-5xx, dlq-not-empty, scoring-p99-latency, lambda-throttles, monthly-cost-anomaly. 4 custom metrics: fraud-rate, avg-risk-score, flagged-count, explanation-latency",
+      "type": "cloudwatch"
+    }
+  ],
+  "summary": "A serverless, event-driven fraud detection platform that scores card transactions in near real-time using rule-based checks and an Isolation Forest ML model on Lambda. Transactions flow through an HTTP API to an SQS-decoupled scoring pipeline. Flagged transactions are stored in DynamoDB with AI-generated explanations from Amazon Bedrock, and high-risk alerts go via SNS. All raw and scored data lands in S3 in Parquet format, queryable through Glue Data Catalog and Athena for fraud pattern analytics. CloudWatch provides dashboards and alarms across all components."
+}
