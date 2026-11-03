@@ -10,7 +10,7 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { randomUUID } from 'node:crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 
 // Clients are created once per container and reused across invocations.
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -27,6 +27,107 @@ export async function deleteFlaggedTransactionsTable(pk: string, sk: string): Pr
 }
 
 const asObject = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
+
+// ---------------------------------------------------------------- flagged transactions
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
+/** Safety cap: stop reading the table after this many pages (about 1 MB each). */
+const MAX_SCAN_PAGES = 20;
+
+export interface FlaggedFilters {
+  minRiskScore?: number;
+  /** ISO date and time, inclusive */
+  startDate?: string;
+  /** ISO date and time, inclusive */
+  endDate?: string;
+  merchantId?: string;
+}
+
+/**
+ * Read the flagged transactions that match the filters, newest first.
+ * This scans the whole table, which is fine while it is small. For a big table, add an index
+ * (the design suggests one on riskScore) and use Query instead.
+ */
+export async function listFlaggedTransactions(filters: FlaggedFilters): Promise<{ items: Record<string, unknown>[]; truncated: boolean }> {
+  const names: Record<string, string> = { '#flagged': 'flagged' };
+  const values: Record<string, unknown> = { ':true': true };
+  const conditions = ['#flagged = :true']; // only real flagged transactions, not the sample or test items
+  if (filters.minRiskScore !== undefined) {
+    names['#risk'] = 'riskScore';
+    values[':minRisk'] = filters.minRiskScore;
+    conditions.push('#risk >= :minRisk');
+  }
+  if (filters.startDate !== undefined || filters.endDate !== undefined) names['#ts'] = 'timestamp';
+  if (filters.startDate !== undefined) {
+    values[':start'] = filters.startDate;
+    conditions.push('#ts >= :start');
+  }
+  if (filters.endDate !== undefined) {
+    values[':end'] = filters.endDate;
+    conditions.push('#ts <= :end');
+  }
+  if (filters.merchantId !== undefined) {
+    names['#merchant'] = 'merchantId';
+    values[':merchant'] = filters.merchantId;
+    conditions.push('#merchant = :merchant');
+  }
+
+  const items: Record<string, unknown>[] = [];
+  let startKey: Record<string, unknown> | undefined;
+  let pages = 0;
+  do {
+    const res = await ddb.send(
+      new ScanCommand({
+        TableName: process.env.FLAGGED_TABLE_TABLE_NAME!,
+        FilterExpression: conditions.join(' AND '),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        ExclusiveStartKey: startKey,
+      }),
+    );
+    items.push(...(res.Items ?? []));
+    startKey = res.LastEvaluatedKey;
+    pages++;
+  } while (startKey && pages < MAX_SCAN_PAGES);
+  items.sort((a, b) => (String(a.timestamp) < String(b.timestamp) ? 1 : -1)); // newest first
+  return { items, truncated: startKey !== undefined };
+}
+
+/** What the API shows for a flagged transaction: no internal keys, and the card ID is masked. */
+function publicView(item: Record<string, unknown>): Record<string, unknown> {
+  const { pk: _pk, sk: _sk, flagged: _flagged, cardId, ...rest } = item;
+  return typeof cardId === 'string' ? { ...rest, cardId: `****${cardId.slice(-4)}` } : rest;
+}
+
+/** Check the query string of GET /flagged. */
+export function parseFlaggedQuery(
+  query: Record<string, string | undefined>,
+): { filters: FlaggedFilters; limit: number; offset: number } | { error: string } {
+  const filters: FlaggedFilters = {};
+  if (query.minRiskScore !== undefined) {
+    const n = Number(query.minRiskScore);
+    if (query.minRiskScore.trim() === '' || !Number.isFinite(n) || n < 0 || n > 1) return { error: 'minRiskScore must be a number between 0 and 1' };
+    filters.minRiskScore = n;
+  }
+  if (query.startDate !== undefined) {
+    if (Number.isNaN(Date.parse(query.startDate))) return { error: 'startDate must be a valid date, for example 2026-10-30' };
+    filters.startDate = new Date(query.startDate).toISOString();
+  }
+  if (query.endDate !== undefined) {
+    if (Number.isNaN(Date.parse(query.endDate))) return { error: 'endDate must be a valid date, for example 2026-10-30' };
+    // a date on its own (2026-10-30) means the whole of that day
+    filters.endDate = /^\d{4}-\d{2}-\d{2}$/.test(query.endDate) ? `${query.endDate}T23:59:59.999Z` : new Date(query.endDate).toISOString();
+  }
+  if (query.merchantId !== undefined) {
+    if (query.merchantId.trim() === '') return { error: 'merchantId must not be empty' };
+    filters.merchantId = query.merchantId;
+  }
+  const limit = query.limit === undefined ? DEFAULT_LIMIT : Number(query.limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) return { error: `limit must be a whole number from 1 to ${MAX_LIMIT}` };
+  const offset = query.offset === undefined ? 0 : Number(query.offset);
+  if (!Number.isInteger(offset) || offset < 0) return { error: 'offset must be a whole number, 0 or more' };
+  return { filters, limit, offset };
+}
 
 // ---------------------------------------------------------------- HTTP API
 /** Path prefix this function serves (the API is shared, so its routes are under /query-function). */
@@ -50,6 +151,15 @@ type Route = [method: string, path: string, run: (req: Req) => Promise<APIGatewa
 const routes: Route[] = [
   ['GET', '/health', async () => {
     return json(200, { ok: true, function: 'query-function' });
+  }],
+  // Flagged transactions, newest first. Optional: minRiskScore, startDate, endDate, merchantId, limit, offset.
+  ['GET', '/flagged', async (req) => {
+    const parsed = parseFlaggedQuery(req.query);
+    if ('error' in parsed) return json(400, { message: parsed.error });
+    const { items, truncated } = await listFlaggedTransactions(parsed.filters);
+    const page = items.slice(parsed.offset, parsed.offset + parsed.limit);
+    const end = parsed.offset + page.length;
+    return json(200, { total: items.length, count: page.length, items: page.map(publicView), ...(end < items.length ? { nextOffset: end } : {}), truncated });
   }],
   ['POST', '/flagged-table', async (req) => {
     const id = randomUUID();

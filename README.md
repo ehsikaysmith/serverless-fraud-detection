@@ -64,6 +64,8 @@ A valid request returns `202` with a `transactionId` and a `messageId`. An inval
 
 `GET /ingest-function/health` is a simple health check.
 
+`GET /query-function/flagged` returns flagged transactions, newest first. Optional parameters: `minRiskScore` (0 to 1), `startDate`, `endDate`, `merchantId`, `limit` (1 to 100, default 20) and `offset`. Card IDs are masked.
+
 ## What is built and what is planned
 
 **Built**
@@ -74,6 +76,7 @@ A valid request returns `202` with a `transactionId` and a `messageId`. An inval
 - Email alerts for high-risk transactions through SNS
 - CloudWatch logs and alarms
 - Unit tests from the starter kit (10 passing)
+- GET /query-function/flagged route to review flagged transactions, with filters and paging
 
 **Planned**
 - Velocity rule: too many transactions on one card in an hour
@@ -81,7 +84,6 @@ A valid request returns `202` with a `transactionId` and a `messageId`. An inval
 - Isolation Forest anomaly model, packaged as a Lambda layer
 - Explanations written by Amazon Bedrock for flagged transactions
 - Data lake in S3 (Parquet) with Glue and Athena for analysis
-- `GET /flagged` route to review flagged transactions
 - Authentication on the API
 - Unit tests for the new validation and scoring logic
 
