@@ -14,7 +14,7 @@ import type { SQSBatchResponse, SQSEvent } from 'aws-lambda';
 import { PublishCommand, SNSClient } from '@aws-sdk/client-sns';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -105,6 +105,9 @@ async function handleSample(value: unknown): Promise<void> {
 // ---------------------------------------------------------------- fraud scoring
 /** Amounts at or above this are suspicious. Use the same currency your transactions use, and change it to suit. */
 const AMOUNT_THRESHOLD = 5000;
+/** More than this many transactions on one card within VELOCITY_WINDOW_MS is suspicious. */
+const VELOCITY_LIMIT = 5;
+const VELOCITY_WINDOW_MS = 60 * 60 * 1000; // one hour
 /** A transaction with a riskScore at or above this is flagged and saved. */
 const FLAG_AT = 0.5;
 /** A transaction with a riskScore at or above this also sends an email alert (high-risk). */
@@ -140,22 +143,82 @@ function asTransaction(value: unknown): Transaction | undefined {
   return undefined;
 }
 
-/** Rule-based score from 0 (normal) to 1 (very suspicious). More rules (velocity, travel, ML model) get added here. */
-export function scoreTransaction(tx: Transaction): ScoredTransaction {
+/**
+ * True if some one-hour stretch that includes `at` has more than `limit` transactions.
+ * Checking every stretch means the answer does not depend on the order messages arrive in.
+ */
+export function exceedsVelocity(times: number[], at: number, limit: number, windowMs: number): boolean {
+  const sorted = [...times].sort((a, b) => a - b);
+  for (const start of sorted) {
+    if (start > at || start < at - windowMs) continue; // the stretch [start, start + windowMs] must include `at`
+    const count = sorted.filter((t) => t >= start && t <= start + windowMs).length;
+    if (count > limit) return true;
+  }
+  return false;
+}
+
+/**
+ * Rule-based score from 0 (normal) to 1 (very suspicious). The score is the strongest rule's score,
+ * plus 0.1 for each extra rule that also fires. More rules (travel, ML model) get added here.
+ */
+export function scoreTransaction(tx: Transaction, signals: { highVelocity?: boolean } = {}): ScoredTransaction {
   const rulesFired: string[] = [];
-  let riskScore = 0;
+  let strongest = 0;
   if (tx.amount >= AMOUNT_THRESHOLD * 5) {
     rulesFired.push('VERY_HIGH_AMOUNT');
-    riskScore = Math.max(riskScore, 0.9);
+    strongest = Math.max(strongest, 0.9);
   } else if (tx.amount >= AMOUNT_THRESHOLD) {
     rulesFired.push('HIGH_AMOUNT');
-    riskScore = Math.max(riskScore, 0.6);
+    strongest = Math.max(strongest, 0.6);
   }
+  if (signals.highVelocity) {
+    rulesFired.push('HIGH_VELOCITY');
+    strongest = Math.max(strongest, 0.7);
+  }
+  const riskScore = rulesFired.length === 0 ? 0 : Math.min(1, Math.round((strongest + 0.1 * (rulesFired.length - 1)) * 100) / 100);
   return { ...tx, riskScore, rulesFired, flagged: riskScore >= FLAG_AT };
 }
 
+/** The times (in ms) of this card's transactions between two instants. */
+async function cardActivityTimes(cardId: string, fromIso: string, toIso: string): Promise<number[]> {
+  const times: number[] = [];
+  let startKey: Record<string, unknown> | undefined;
+  let pages = 0;
+  do {
+    const res = await ddb.send(
+      new QueryCommand({
+        TableName: process.env.FLAGGED_TABLE_TABLE_NAME!,
+        KeyConditionExpression: '#pk = :pk AND #sk BETWEEN :from AND :to',
+        ExpressionAttributeNames: { '#pk': 'pk', '#sk': 'sk' },
+        ExpressionAttributeValues: { ':pk': `CARD#${cardId}`, ':from': fromIso, ':to': `${toIso}#~` },
+        ConsistentRead: true, // so a transaction saved a moment ago is counted
+        ExclusiveStartKey: startKey,
+      }),
+    );
+    for (const item of res.Items ?? []) {
+      const time = Date.parse(String(item.sk).split('#')[0] ?? '');
+      if (!Number.isNaN(time)) times.push(time);
+    }
+    startKey = res.LastEvaluatedKey;
+    pages++;
+  } while (startKey && pages < 10);
+  return times;
+}
+
+/**
+ * Remember this transaction under its card, then check how busy the card has been.
+ * History items are keyed pk = CARD#<cardId>, sk = <timestamp>#<transactionId>, so a message that
+ * arrives twice just overwrites itself. They have no "flagged" field, so GET /flagged ignores them.
+ */
+async function isHighVelocity(tx: Transaction): Promise<boolean> {
+  const at = new Date(tx.timestamp).getTime();
+  await putFlaggedTransactionsTable({ pk: `CARD#${tx.cardId}`, sk: `${new Date(at).toISOString()}#${tx.transactionId}`, transactionId: tx.transactionId });
+  const times = await cardActivityTimes(tx.cardId, new Date(at - VELOCITY_WINDOW_MS).toISOString(), new Date(at + VELOCITY_WINDOW_MS).toISOString());
+  return exceedsVelocity(times, at, VELOCITY_LIMIT, VELOCITY_WINDOW_MS);
+}
+
 async function handleTransaction(tx: Transaction): Promise<void> {
-  const scored = scoreTransaction(tx);
+  const scored = scoreTransaction(tx, { highVelocity: await isHighVelocity(tx) });
   console.log(JSON.stringify({ msg: 'Scored transaction', transactionId: scored.transactionId, riskScore: scored.riskScore, rulesFired: scored.rulesFired, flagged: scored.flagged }));
   if (!scored.flagged) return;
   // Same key every time for the same transaction, so a message that arrives twice just overwrites itself.
