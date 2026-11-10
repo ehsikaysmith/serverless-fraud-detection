@@ -2,7 +2,7 @@
 
 A serverless, event-driven pipeline that scores card transactions as they arrive. Transactions come in through an HTTP API, are checked and queued, scored by rules, and saved when they look suspicious. High-risk transactions also send an email alert.
 
-> **Status: working prototype.** The pipeline runs end to end on AWS, but only one fraud rule is built so far. See [What is built and what is planned](#what-is-built-and-what-is-planned). Use made-up data only.
+> **Status: working prototype.** The pipeline runs end to end on AWS, but only two fraud rule is built so far. See [What is built and what is planned](#what-is-built-and-what-is-planned). Use made-up data only.
 
 ## Architecture
 
@@ -42,6 +42,10 @@ Each transaction gets a risk score from 0 to 1.
 
 A transaction is flagged at a score of 0.5 or more, and an alert is sent at 0.8 or more. The thresholds are constants at the top of `functions/scoring-function/index.ts`.
 
+**Velocity rule:** more than 5 transactions on one card within any one-hour stretch fires `HIGH_VELOCITY` (risk 0.7). Each card's recent transactions are kept as small history records in the same table.
+
+**Combining rules:** the score is the strongest rule's score plus 0.1 for each extra rule that also fires, up to a maximum of 1. For example, a 9500 transaction on a busy card scores 0.8, which sends an alert.
+
 A message that is not a valid transaction fails, is retried, and after 5 failed attempts moves to the dead-letter queue.
 
 ## API
@@ -77,9 +81,9 @@ A valid request returns `202` with a `transactionId` and a `messageId`. An inval
 - CloudWatch logs and alarms
 - Unit tests for validation, scoring rules, velocity and query filters, plus the starter kit's tests
 - GET /query-function/flagged route to review flagged transactions, with filters and paging
+- Velocity rule: more than 5 transactions on one card within an hour is flagged (HIGH_VELOCITY)
 
 **Planned**
-- Velocity rule: too many transactions on one card in an hour
 - Impossible-travel rule
 - Isolation Forest anomaly model, packaged as a Lambda layer
 - Explanations written by Amazon Bedrock for flagged transactions
