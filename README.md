@@ -75,7 +75,7 @@ A valid request returns `202` with a `transactionId` and a `messageId`. An inval
 - Flagged transactions saved to DynamoDB
 - Email alerts for high-risk transactions through SNS
 - CloudWatch logs and alarms
-- Unit tests from the starter kit (10 passing)
+- Unit tests for validation, scoring rules, velocity and query filters, plus the starter kit's tests
 - GET /query-function/flagged route to review flagged transactions, with filters and paging
 
 **Planned**
@@ -85,7 +85,7 @@ A valid request returns `202` with a `transactionId` and a `messageId`. An inval
 - Explanations written by Amazon Bedrock for flagged transactions
 - Data lake in S3 (Parquet) with Glue and Athena for analysis
 - Authentication on the API
-- Unit tests for the new validation and scoring logic
+- Tests for the AWS calls (mocked clients)
 
 ## Deploying
 
